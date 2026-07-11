@@ -1,2 +1,3 @@
 # tiny-llama
-A minimal LLaMA model inference engine built purely in Rust
+
+A minimal LLaMA model inference engine built purely in Rust. 

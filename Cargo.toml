@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 anyhow = "1.0.102"
 candle-core = "0.11.0"
+candle-nn = "0.11.0"
 crossterm = "0.29.0"
 half = "2.7.1"
 ratatui = "0.30.2"

@@ -1408,19 +1408,44 @@ fn predict_next_token(
     //
     // This needed for the attention mask and marking the token positions in positional embeddings.
     let max_sequence_length = hidden_state.get_shape().dim(1)?;
+    // We will use this later to mark the token position info.
     let (cos_table, sin_table) = precompute_theta_tables(
         max_sequence_length,
         model_configurations.head_dim,
         model_configurations.rope_theta,
     )?;
 
+    // Create an attention mask with the max sequence length we got from above.
     let attention_mask = create_attention_mask(max_sequence_length)?;
 
+    // Pass the hidden state through each transformer layer.
+    // The number of layers is defined by the model architecture in the configuration.
+    // Each layer contains its own Q, K, V, O weights, plus an MLP,
+    // and applies attention followed by a residual connection.
+    // The final hidden state (after all layers) will be projected to logits.
+    //
+    // A residual connection means the input to a sublayer is added to its output (skip connection).
+    // This helps with gradient flow and lets the model learn incremental transformations.
     for index in 0..model_configurations.num_hidden_layers {
         if let Some(layer) = llama_model.layers.get(index) {
-            // Since we are passing the entire prompt into the model, we don't need to have a current attention mask yet
+            // The full‑sequence attention mask (computed above) already covers
+            // every token position, so we don't need to slice it yet.
+            // (During token‑by‑token generation we would narrow the mask to
+            //  the current position.)
 
             let input_norm_started_at = Instant::now();
+            // RMSNorm: Normalize each hidden vector to unit root mean square (RMS).
+            // This keeps activations well‑scaled, preventing runaway values.
+            // (Values typically remain within a few units, rather than exploding to 10 or 100.)
+            //
+            // The original Transformer used LayerNorm (mean subtraction + RMS scaling).
+            // LLaMA uses RMSNorm, which drops the mean subtraction, reducing computation
+            // while still providing effective normalization.
+            //
+            // After normalization, a learned weight vector (input_layernorm) scales each
+            // hidden dimension. This weight is trained along with the model.
+            //
+            // Epsilon prevents division by zero when the RMS is extremely small.
             let normalized_hidden_state = compute_rms_norm(
                 &hidden_state,
                 &layer.input_layernorm,
@@ -1436,6 +1461,17 @@ fn predict_next_token(
             );
 
             let q_projection_started_at = Instant::now();
+            // Refer to `compute_multi_head_attention` and `compute_scaled_dot_product_attention`
+            // for QKVO explanations.
+            //
+            // The shape of QKV weight matrices is [hidden_size, hidden_size],
+            // where the first hidden_size marks the output matrix's hidden_size
+            // and the second hidden_size marks the input matrix's hidden_size
+            //
+            // The shape of QKV after projection will become [batch_size, num_tokens, hidden_size].
+            // Notice that LLaMA models usually don't include a bias.
+            //
+            // After the projection, it will outp
             let q = compute_linear_layer(&layer.q_projection, &normalized_hidden_state, None)?;
             record_tensor_flow_step(
                 &mut debug_state,
@@ -1468,8 +1504,12 @@ fn predict_next_token(
                 v_projection_started_at,
             );
 
-            // Reshape the QKV into 4D matrices: [batch_size, num_heads, sequence_length, head_dim]
-            // To: [batch_size, sequence_length, num_heads, head_dim]
+            // Reshape the QKV from 3D matrices: [batch_size, num_tokens, hidden_size]
+            // To: [batch, sequence_length, num_attention_heads, head_dim]
+            // where the hidden_size is split into num_attention_heads and head_dim.
+            //
+            // num_attention_heads: The number of attention heads used when computing attentions.
+            // head_dim: The size of each head.
             let q_shape_before_reshape = tensor_shape(&q);
             let q_reshape_started_at = Instant::now();
             let q = reshape(
@@ -1531,8 +1571,11 @@ fn predict_next_token(
             );
 
             // Change the shape
-            // from [batch_size, sequence_length, num_heads, head_dim]
-            // to [batch_size, num_heads, sequence_length, head_dim]
+            // from [batch_size, num_tokens, num_heads, head_dim]
+            // to [batch_size, num_heads, num_tokens, head_dim]
+            //
+            // We basically swapped the position of num_tokens with num_heads
+            // to match the shape required when computing attentions.
             let q_shape_before_transpose = tensor_shape(&q);
             let q_transpose_started_at = Instant::now();
             let q = transpose_with_dim(&q, 1, 2)?;
@@ -1569,6 +1612,11 @@ fn predict_next_token(
                 v_transpose_started_at,
             );
 
+            // For each token position, RoPE rotates pairs of adjacent dimensions
+            // (x, y) in the head vector by an angle derived from the token index.
+            // This encodes absolute position into relative attention scores,
+            // so that the model is aware of the semantic difference between having
+            // a word appears earlier vs later in a sentence.
             let q_shape_before_rope = tensor_shape(&q);
             let q_rope_started_at = Instant::now();
             let q = compute_rotary_position_embeddings(&q, &cos_table, &sin_table)?;
@@ -1593,6 +1641,8 @@ fn predict_next_token(
                 k_rope_started_at,
             );
 
+            // Apply Groupped Attention Query, when number of KV heads does not match Q's.
+            // Paper: https://arxiv.org/pdf/2305.13245
             if model_configurations.num_attention_heads != model_configurations.num_key_value_heads
             {
                 let align_started_at = Instant::now();
